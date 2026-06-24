@@ -1,0 +1,1453 @@
+// ============================================================
+// REMINDER COMPANION ROBOT - FULL Code VERSION
+// Board: ESPDUINO-32 HW-707
+// ============================================================
+
+#define BLYNK_TEMPLATE_ID   "TMPL6KQ-fIWEt"
+#define BLYNK_TEMPLATE_NAME "Reminder Companion Kun"
+#define BLYNK_AUTH_TOKEN    "CrChwgPiIee0wA-nSvBTsWKuiIb4FhNO"
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <RTClib.h>
+#include <DFRobotDFPlayerMini.h>
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Preferences.h>
+
+// ============================================================
+// WIFI
+// ============================================================
+char ssid[] = "SHM";
+char pass[] = "12345678";
+
+// ============================================================
+// PIN DEFINITIONS
+// ============================================================
+#define SDA_PIN          SDA
+#define SCL_PIN          SCL
+#define DF_RX            19      // IO19 — UART2 remapped
+#define DF_TX            12      // IO12 — UART2 remapped
+#define SERVO_PIN        18      // IO18 — safe, no strapping issue
+#define TOUCH_PIN        2       // IO2  — valid capacitive touch pin
+#define TOUCH_THRESH     30
+#define PIR_PIN          23
+#define IR_OBSTACLE_PIN  5       // LOW = obstacle detected
+#define IR_FALL_PIN      13      // LOW = floor safe, HIGH = edge/drop
+#define OBSTACLE_DETECTED LOW
+#define FLOOR_SAFE        LOW
+
+// Motor pins
+#define IN1  25
+#define IN2  17
+#define IN3  16
+#define IN4  27
+#define ENA  26
+#define ENB  14
+#define MOTOR_SPEED 160
+
+// ============================================================
+// OLED
+// ============================================================
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define OLED_ADDR    0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ============================================================
+// MODULES
+// ============================================================
+RTC_DS3231           rtc;
+HardwareSerial       dfSerial(2);
+DFRobotDFPlayerMini  dfPlayer;
+Servo                armServo;
+BlynkTimer           timer;
+Preferences          prefs;
+
+bool          dfReady                   = false;
+bool          blynkConfigured           = false;
+unsigned long lastBlynkReconnectAttempt = 0;
+unsigned long lastWiFiReconnectAttempt  = 0;
+const unsigned long BLYNK_RECONNECT_MS  = 10000UL;
+const unsigned long WIFI_RECONNECT_MS   = 10000UL;
+
+// ============================================================
+// DFPLAYER TRACKS
+// Put 0001.mp3, 0002.mp3, etc. on the microSD card.
+// ============================================================
+#define TRACK_MEDICINE 1
+#define TRACK_MEAL     2
+#define TRACK_GENERAL  3
+#define TRACK_CONFIRM  4
+#define TRACK_SNOOZE   5
+#define TRACK_CHEER    6
+
+// ============================================================
+// REMINDER DATA
+// ============================================================
+struct Reminder {
+  int    hour;
+  int    minute;
+  String label;
+  String message;
+  int    track;
+  bool   triggeredToday;
+  bool   skippedToday;
+  bool   disabled;
+};
+
+#define MAX_REMINDERS 10
+int numReminders = 6;
+Reminder reminders[MAX_REMINDERS] = {
+  {8,  0,  "Medicine", "Time to take your morning medicine!", TRACK_MEDICINE, false, false, false},
+  {8,  30, "Breakfast","Breakfast time! Please eat your meal.", TRACK_MEAL,    false, false, false},
+  {13, 0,  "Lunch",    "Lunch time! Do not skip your meal.",   TRACK_MEAL,    false, false, false},
+  {15, 0,  "Medicine", "Afternoon medicine time!",             TRACK_MEDICINE, false, false, false},
+  {19, 0,  "Dinner",   "Dinner time! Please eat your meal.",   TRACK_MEAL,    false, false, false},
+  {21, 0,  "Medicine", "Night medicine time!",                 TRACK_MEDICINE, false, false, false}
+};
+
+#define STORE_LABEL_LEN 20
+#define STORE_MSG_LEN   90
+struct StoredReminder {
+  int  hour;
+  int  minute;
+  int  track;
+  bool disabled;
+  char label  [STORE_LABEL_LEN];
+  char message[STORE_MSG_LEN];
+};
+
+// ============================================================
+// ROBOT STATE
+// ============================================================
+enum RobotState {
+  IDLE,
+  WAITING_RESPONSE,
+  SNOOZED,
+  CONFIRMING,
+  PIR_INTERACTION
+};
+
+RobotState    robotState            = IDLE;
+int           activeIndex           = -1;
+int           selectedReminderIndex = 0;
+unsigned long snoozeUntil           = 0;
+unsigned long nextReminderAction    = 0;
+unsigned long pirWaitUntil          = 0;
+int           snoozeMinutes         = 5;
+
+const unsigned long CONFIRM_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+const unsigned long RETRY_WAIT_MS      = 5UL * 60UL * 1000UL;
+const unsigned long PIR_APPROACH_MS    = 1200UL;
+const unsigned long PIR_WAIT_MS        = 10000UL;
+
+int reminderRetryStage = 0;
+// 0 = first reminder waiting for touch
+// 1 = sad face shown, waiting 5 minutes before replay
+// 2 = reminder replayed, waiting for touch
+// 3 = angry retry mode, repeats every 5 minutes
+
+bool manualMotorControl = false;
+bool autoMotionActive   = false;
+bool avoidanceRunning   = false;
+bool fallDetected       = false;
+bool obstacleDetected   = false;
+
+int newReminderHour = 8;
+int newReminderMin  = 0;
+int newReminderType = 0;
+
+const int SLOW_MOTOR_SPEED = 100;
+const int TURN_MOTOR_SPEED = 150;
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+void robotTask();
+void connectWiFi();
+void connectBlynk();
+void connectBlynkIfNeeded();
+void safeBlynkWrite(int pin, const String &value);
+void responsiveDelay(unsigned long ms, bool checkSafety = true);
+bool timeReached(unsigned long target);
+void moveForward();
+void moveForwardSlow();
+void moveForwardSpeed(int speed);
+void moveBackward();
+void turnLeft();
+void turnRight();
+void turnRightRaw(int speed);
+void stopMotors();
+bool floorIsSafe();
+bool frontIsClear();
+bool canMoveForwardSafely();
+bool canMoveBasicSafely();
+bool touchIsPressed();
+void checkSensors();
+void handleObstacle();
+void handleFallDetected();
+void obstacleAvoidManeuver();
+void recoverGroundByTurningRight();
+void autonomousForwardStep(unsigned long ms);
+void normalNavigationStep();
+void handlePirSensor();
+void startPirInteraction();
+void finishPirInteraction();
+void servoConfirmGesture();
+void waveArm();
+void cheerfulAction();
+void stopReminderAudio();
+// Face function forward declarations
+void showNeutralFace();
+void showHappyFace();
+void showSadFace();
+void showAngryFace();
+void showSleepyFace();
+void showSurprisedFace();
+void showAlertFace();
+void showEmotion(String mood);
+void showMessage(String title, String body);
+void showReminderScreen(int idx, String title);
+void showMotorStatus(String status);
+void updateIdleDisplay(DateTime now);
+void checkTouchSensor();
+void checkReminders(DateTime now);
+void handleReminderTimeout();
+void resetTriggersAtMidnight(DateTime now);
+void triggerReminder(int idx);
+void doConfirm();
+void doSnooze();
+String getReminderSummary(int idx);
+void deleteReminder(int idx);
+void saveReminders();
+bool loadReminders();
+void copyStringToChar(char *dest, size_t len, const String &src);
+
+// ============================================================
+// STORAGE
+// ============================================================
+void copyStringToChar(char *dest, size_t len, const String &src) {
+  strncpy(dest, src.c_str(), len - 1);
+  dest[len - 1] = '\0';
+}
+
+void saveReminders() {
+  prefs.begin("reminders", false);
+  prefs.putInt("count", numReminders);
+  for (int i = 0; i < numReminders; i++) {
+    StoredReminder sr;
+    sr.hour     = reminders[i].hour;
+    sr.minute   = reminders[i].minute;
+    sr.track    = reminders[i].track;
+    sr.disabled = reminders[i].disabled;
+    copyStringToChar(sr.label,   STORE_LABEL_LEN, reminders[i].label);
+    copyStringToChar(sr.message, STORE_MSG_LEN,   reminders[i].message);
+    String key = "r" + String(i);
+    prefs.putBytes(key.c_str(), &sr, sizeof(sr));
+  }
+  prefs.end();
+  Serial.println("Reminders saved.");
+}
+
+bool loadReminders() {
+  prefs.begin("reminders", true);
+  int savedCount = prefs.getInt("count", -1);
+  if (savedCount < 0 || savedCount > MAX_REMINDERS) {
+    prefs.end();
+    Serial.println("No saved reminders. Using defaults.");
+    return false;
+  }
+  numReminders = savedCount;
+  for (int i = 0; i < numReminders; i++) {
+    StoredReminder sr;
+    String key       = "r" + String(i);
+    size_t bytesRead = prefs.getBytes(key.c_str(), &sr, sizeof(sr));
+    if (bytesRead == sizeof(sr)) {
+      reminders[i].hour          = sr.hour;
+      reminders[i].minute        = sr.minute;
+      reminders[i].track         = sr.track;
+      reminders[i].disabled      = sr.disabled;
+      reminders[i].label         = String(sr.label);
+      reminders[i].message       = String(sr.message);
+      reminders[i].triggeredToday = false;
+      reminders[i].skippedToday  = false;
+    }
+  }
+  prefs.end();
+  Serial.println("Reminders loaded.");
+  return true;
+}
+
+// ============================================================
+// WIFI — FIXED
+// Retries on dropout; skips if already connected.
+// ============================================================
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Serial.println("[WiFi] Connecting...");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000UL) {
+    delay(500);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected: " + WiFi.localIP().toString());
+  } else {
+    Serial.println("\n[WiFi] Connection FAILED. Will retry later.");
+  }
+}
+
+// ============================================================
+// BLYNK — FIXED
+// Guards against double-connect; uses config+connect pattern.
+// ============================================================
+void connectBlynk() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (Blynk.connected()) return;
+  Serial.println("[Blynk] Attempting connection...");
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  if (Blynk.connect(5000)) {
+    Serial.println("[Blynk] Connected!");
+    blynkConfigured = true;
+  } else {
+    Serial.println("[Blynk] Failed. Will retry later.");
+  }
+}
+
+// ============================================================
+// CONNECT BLYNK IF NEEDED — FIXED
+// Called by timer every 10 seconds; handles both WiFi and Blynk dropout.
+// ============================================================
+void connectBlynkIfNeeded() {
+  unsigned long now = millis();
+  // Step 1: check and recover WiFi first.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (now - lastWiFiReconnectAttempt >= WIFI_RECONNECT_MS) {
+      lastWiFiReconnectAttempt = now;
+      Serial.println("[WiFi] Lost connection. Reconnecting...");
+      WiFi.disconnect();
+      connectWiFi();
+    }
+    return; // No point trying Blynk without WiFi.
+  }
+  // Step 2: reconnect Blynk if WiFi is fine but Blynk dropped.
+  if (!Blynk.connected()) {
+    if (now - lastBlynkReconnectAttempt >= BLYNK_RECONNECT_MS) {
+      lastBlynkReconnectAttempt = now;
+      Serial.println("[Blynk] Disconnected. Reconnecting...");
+      connectBlynk();
+    }
+  }
+}
+
+// ============================================================
+// SAFE BLYNK WRITE — FIXED
+// Guards every virtual write so disconnected state never crashes.
+// ============================================================
+void safeBlynkWrite(int pin, const String &value) {
+  if (!Blynk.connected()) {
+    Serial.println("[Blynk] Skipped write to V" + String(pin) + ": not connected.");
+    return;
+  }
+  Blynk.virtualWrite(pin, value);
+}
+
+// ============================================================
+// UTILITY
+// ============================================================
+bool timeReached(unsigned long target) {
+  return (long)(millis() - target) >= 0;
+}
+
+void responsiveDelay(unsigned long ms, bool checkSafety) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    Blynk.run();
+    timer.run();
+    if (checkSafety) {
+      if (!floorIsSafe()) { stopMotors(); return; }
+      if (!frontIsClear()) { stopMotors(); return; }
+    }
+    delay(10);
+  }
+}
+
+// ============================================================
+// REMINDER HELPERS
+// ============================================================
+String getReminderSummary(int idx) {
+  if (idx < 0 || idx >= numReminders) return "Invalid";
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", reminders[idx].hour, reminders[idx].minute);
+  return "#" + String(idx) + " " + reminders[idx].label + " @ " + String(buf);
+}
+
+void deleteReminder(int idx) {
+  if (idx < 0 || idx >= numReminders) return;
+  for (int i = idx; i < numReminders - 1; i++) {
+    reminders[i] = reminders[i + 1];
+  }
+  numReminders--;
+  if (numReminders == 0) {
+    selectedReminderIndex = 0;
+  } else if (selectedReminderIndex >= numReminders) {
+    selectedReminderIndex = numReminders - 1;
+  }
+  if (activeIndex == idx) {
+    activeIndex = -1;
+    robotState  = IDLE;
+    stopMotors();
+    showEmotion("neutral");
+  } else if (activeIndex > idx) {
+    activeIndex--;
+  }
+}
+
+// ============================================================
+// BLYNK HANDLERS
+// V0  = status terminal/label
+// V1  = snooze button
+// V2  = confirm button
+// V3  = hour input
+// V4  = minute input
+// V5  = snooze minute input
+// V6  = reminder type
+// V7  = add reminder
+// V8  = move forward
+// V9  = move backward
+// V10 = turn left
+// V11 = turn right
+// V12 = stop
+// V13 = off today
+// V14 = permanent disable/enable
+// V15 = delete
+// V16 = select reminder index
+// ============================================================
+BLYNK_WRITE(V1) {
+  if (param.asInt() == 1 && (robotState == WAITING_RESPONSE || robotState == SNOOZED))
+    doSnooze();
+}
+
+BLYNK_WRITE(V2) {
+  if (param.asInt() == 1 && robotState == WAITING_RESPONSE) doConfirm();
+}
+
+BLYNK_WRITE(V3) { newReminderHour = param.asInt(); }
+BLYNK_WRITE(V4) { newReminderMin  = param.asInt(); }
+BLYNK_WRITE(V5) { snoozeMinutes   = constrain(param.asInt(), 1, 60); }
+BLYNK_WRITE(V6) { newReminderType = param.asInt(); }
+
+BLYNK_WRITE(V7) {
+  if (param.asInt() != 1) return;
+  if (numReminders >= MAX_REMINDERS) {
+    safeBlynkWrite(V0, "Reminder list full.");
+    return;
+  }
+  if (newReminderHour < 0 || newReminderHour > 23 ||
+      newReminderMin  < 0 || newReminderMin  > 59) {
+    safeBlynkWrite(V0, "Invalid reminder time.");
+    return;
+  }
+  String lbl, msg;
+  int    trk;
+  if (newReminderType == 0) {
+    lbl = "Medicine"; msg = "Time to take your medicine!";    trk = TRACK_MEDICINE;
+  } else if (newReminderType == 1) {
+    lbl = "Meal";     msg = "Time to eat your meal!";         trk = TRACK_MEAL;
+  } else {
+    lbl = "Reminder"; msg = "You have a scheduled task!";     trk = TRACK_GENERAL;
+  }
+  for (int i = 0; i < numReminders; i++) {
+    if (reminders[i].hour   == newReminderHour &&
+        reminders[i].minute == newReminderMin  &&
+        reminders[i].label  == lbl) {
+      safeBlynkWrite(V0, "Reminder already exists.");
+      return;
+    }
+  }
+  reminders[numReminders] = {
+    newReminderHour, newReminderMin, lbl, msg, trk, false, false, false
+  };
+  numReminders++;
+  saveReminders();
+  char buf[6];
+  snprintf(buf, sizeof(buf), "%02d:%02d", newReminderHour, newReminderMin);
+  String info = "Added: " + lbl + " at " + String(buf);
+  Serial.println(info);
+  safeBlynkWrite(V0, info);
+  showMessage("Reminder Added", lbl + " at " + String(buf));
+  responsiveDelay(1000, false);
+  showEmotion("neutral");
+}
+
+BLYNK_WRITE(V8) {
+  if (param.asInt() == 1) {
+    manualMotorControl = true;
+    moveForward();
+    showMotorStatus("Moving Forward");
+  } else {
+    stopMotors();
+    manualMotorControl = false;
+    showMotorStatus("Stopped");
+  }
+}
+
+BLYNK_WRITE(V9) {
+  if (param.asInt() == 1) {
+    manualMotorControl = true;
+    moveBackward();
+    showMotorStatus("Moving Backward");
+  } else {
+    stopMotors();
+    manualMotorControl = false;
+    showMotorStatus("Stopped");
+  }
+}
+
+BLYNK_WRITE(V10) {
+  if (param.asInt() == 1) {
+    manualMotorControl = true;
+    turnLeft();
+    showMotorStatus("Turning Left");
+  } else {
+    stopMotors();
+    manualMotorControl = false;
+    showMotorStatus("Stopped");
+  }
+}
+
+BLYNK_WRITE(V11) {
+  if (param.asInt() == 1) {
+    manualMotorControl = true;
+    turnRight();
+    showMotorStatus("Turning Right");
+  } else {
+    stopMotors();
+    manualMotorControl = false;
+    showMotorStatus("Stopped");
+  }
+}
+
+BLYNK_WRITE(V12) {
+  if (param.asInt() != 1) return;
+  stopMotors();
+  autoMotionActive   = false;
+  manualMotorControl = false;
+  if (floorIsSafe()) {
+    fallDetected = false;
+    showMotorStatus("Stopped");
+    safeBlynkWrite(V0, "Motor stopped.");
+  } else {
+    fallDetected = true;
+    showMessage("Edge Warning", "Move robot to safe ground.");
+    safeBlynkWrite(V0, "Motor stopped. Edge sensor still unsafe.");
+  }
+}
+
+BLYNK_WRITE(V16) {
+  int val = param.asInt();
+  if (numReminders == 0) {
+    safeBlynkWrite(V0, "No reminders exist.");
+    return;
+  }
+  if (val < 0)              val = 0;
+  if (val >= numReminders)  val = numReminders - 1;
+  selectedReminderIndex = val;
+  String info = "Selected: " + getReminderSummary(selectedReminderIndex);
+  if      (reminders[selectedReminderIndex].disabled)     info += " [DISABLED]";
+  else if (reminders[selectedReminderIndex].skippedToday) info += " [OFF TODAY]";
+  else if (reminders[selectedReminderIndex].triggeredToday) info += " [DONE TODAY]";
+  else                                                      info += " [ACTIVE]";
+  Serial.println(info);
+  safeBlynkWrite(V0, info);
+}
+
+BLYNK_WRITE(V13) {
+  if (param.asInt() != 1) return;
+  if (numReminders == 0) {
+    safeBlynkWrite(V0, "No reminders exist.");
+    return;
+  }
+  if (selectedReminderIndex < 0 || selectedReminderIndex >= numReminders) {
+    safeBlynkWrite(V0, "Invalid selection. Use V16 first.");
+    return;
+  }
+  reminders[selectedReminderIndex].skippedToday   = true;
+  reminders[selectedReminderIndex].triggeredToday = true;
+  if (activeIndex == selectedReminderIndex &&
+      (robotState == WAITING_RESPONSE || robotState == SNOOZED)) {
+    robotState  = IDLE;
+    activeIndex = -1;
+    stopMotors();
+  }
+  String info = "Off today: " + getReminderSummary(selectedReminderIndex);
+  Serial.println(info);
+  safeBlynkWrite(V0, info);
+  showMessage("Off Today", reminders[selectedReminderIndex].label + " will reset tomorrow.");
+  responsiveDelay(1000, false);
+  showEmotion("neutral");
+}
+
+BLYNK_WRITE(V14) {
+  if (param.asInt() != 1) return;
+  if (numReminders == 0) {
+    safeBlynkWrite(V0, "No reminders exist.");
+    return;
+  }
+  if (selectedReminderIndex < 0 || selectedReminderIndex >= numReminders) {
+    safeBlynkWrite(V0, "Invalid selection. Use V16 first.");
+    return;
+  }
+  reminders[selectedReminderIndex].disabled = !reminders[selectedReminderIndex].disabled;
+  bool   nowDisabled = reminders[selectedReminderIndex].disabled;
+  String info;
+  if (nowDisabled) {
+    info = "Permanently disabled: " + getReminderSummary(selectedReminderIndex);
+    showMessage("Disabled", reminders[selectedReminderIndex].label + " is now off.");
+    if (activeIndex == selectedReminderIndex &&
+        (robotState == WAITING_RESPONSE || robotState == SNOOZED)) {
+      robotState  = IDLE;
+      activeIndex = -1;
+      stopMotors();
+    }
+  } else {
+    reminders[selectedReminderIndex].triggeredToday = false;
+    reminders[selectedReminderIndex].skippedToday   = false;
+    info = "Re-enabled: " + getReminderSummary(selectedReminderIndex);
+    showMessage("Re-enabled", reminders[selectedReminderIndex].label + " is active.");
+  }
+  saveReminders();
+  Serial.println(info);
+  safeBlynkWrite(V0, info);
+  responsiveDelay(1000, false);
+  showEmotion("neutral");
+}
+
+BLYNK_WRITE(V15) {
+  if (param.asInt() != 1) return;
+  if (numReminders == 0) {
+    safeBlynkWrite(V0, "No reminders to delete.");
+    return;
+  }
+  if (selectedReminderIndex < 0 || selectedReminderIndex >= numReminders) {
+    safeBlynkWrite(V0, "Invalid selection. Use V16 first.");
+    return;
+  }
+  String deleted = getReminderSummary(selectedReminderIndex);
+  deleteReminder(selectedReminderIndex);
+  saveReminders();
+  String info = "Deleted: " + deleted + " | Left: " + String(numReminders);
+  Serial.println(info);
+  safeBlynkWrite(V0, info);
+  showMessage("Deleted", deleted);
+  responsiveDelay(1000, false);
+  showEmotion("neutral");
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  loadReminders();
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("OLED init failed.");
+    while (true) delay(10);
+  }
+  showEmotion("neutral");
+
+  if (!rtc.begin()) {
+    Serial.println("RTC not found.");
+    showMessage("RTC Error", "Check SDA/SCL wiring.");
+    while (true) delay(10);
+  }
+  if (rtc.lostPower()) {
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  dfSerial.begin(9600, SERIAL_8N1, DF_RX, DF_TX);
+  delay(500);
+  if (!dfPlayer.begin(dfSerial)) {
+    Serial.println("DFPlayer failed.");
+    dfReady = false;
+  } else {
+    dfPlayer.volume(25);
+    dfReady = true;
+  }
+
+  armServo.attach(SERVO_PIN);
+  armServo.write(0);
+
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  pinMode(PIR_PIN,         INPUT);
+  pinMode(IR_OBSTACLE_PIN, INPUT);
+  pinMode(IR_FALL_PIN,     INPUT);
+
+  connectWiFi();
+  connectBlynk();
+  safeBlynkWrite(V0, "Robot Ready.");
+
+  showEmotion("happy");
+  if (dfReady) dfPlayer.play(TRACK_CHEER);
+  waveArm();
+  responsiveDelay(500, false);
+  showEmotion("neutral");
+
+  timer.setInterval(200L,   robotTask);
+  timer.setInterval(10000L, connectBlynkIfNeeded);
+
+  Serial.println("Reminder Companion Robot started.");
+}
+
+// ============================================================
+// LOOP — FIXED
+// Removed redundant direct call to connectBlynkIfNeeded();
+// the timer already calls it every 10 seconds.
+// ============================================================
+void loop() {
+  Blynk.run();
+  timer.run();
+}
+
+// ============================================================
+// MAIN ROBOT TASK
+// ============================================================
+void robotTask() {
+  DateTime now = rtc.now();
+  resetTriggersAtMidnight(now);
+
+  // Priority 1: safety always runs first.
+  checkSensors();
+
+  // Reminder has priority over PIR greeting and normal navigation.
+  checkReminders(now);
+  checkTouchSensor();
+
+  // PIR greeting only works when no reminder is active.
+  handlePirSensor();
+
+  // If nothing special is happening, keep navigating normally.
+  normalNavigationStep();
+  updateIdleDisplay(now);
+}
+
+// ============================================================
+// MIDNIGHT RESET
+// ============================================================
+void resetTriggersAtMidnight(DateTime now) {
+  static int lastDay = -1;
+  if (now.day() != lastDay) {
+    lastDay = now.day();
+    for (int i = 0; i < numReminders; i++) {
+      reminders[i].triggeredToday = false;
+      reminders[i].skippedToday  = false;
+    }
+    Serial.println("Daily reminder flags reset.");
+  }
+}
+
+// ============================================================
+// REMINDER LOGIC
+// ============================================================
+void checkReminders(DateTime now) {
+  if (fallDetected) return;
+
+  if (robotState == SNOOZED && timeReached(snoozeUntil)) {
+    if (activeIndex < 0 || activeIndex >= numReminders ||
+        reminders[activeIndex].disabled ||
+        reminders[activeIndex].skippedToday) {
+      robotState  = IDLE;
+      activeIndex = -1;
+      stopMotors();
+      safeBlynkWrite(V0, "Snoozed reminder is off/disabled.");
+      return;
+    }
+    reminderRetryStage = 0;
+    triggerReminder(activeIndex);
+    return;
+  }
+
+  if (robotState == WAITING_RESPONSE &&
+      activeIndex >= 0 &&
+      timeReached(nextReminderAction)) {
+    handleReminderTimeout();
+    return;
+  }
+
+  // Reminder can interrupt PIR interaction, but not confirming/snoozed/waiting states.
+  if (robotState != IDLE && robotState != PIR_INTERACTION) return;
+
+  for (int i = 0; i < numReminders; i++) {
+    if (reminders[i].disabled)      continue;
+    if (reminders[i].skippedToday)  continue;
+    if (reminders[i].triggeredToday) continue;
+    if (now.hour()   == reminders[i].hour &&
+        now.minute() == reminders[i].minute) {
+      if (robotState == PIR_INTERACTION) {
+        stopMotors();
+        robotState = IDLE;
+      }
+      reminders[i].triggeredToday = true;
+      activeIndex        = i;
+      reminderRetryStage = 0;
+      triggerReminder(i);
+      return;
+    }
+  }
+}
+
+void triggerReminder(int idx) {
+  if (idx < 0 || idx >= numReminders) {
+    robotState  = IDLE;
+    activeIndex = -1;
+    safeBlynkWrite(V0, "Invalid reminder index.");
+    return;
+  }
+  if (reminders[idx].disabled || reminders[idx].skippedToday) {
+    robotState  = IDLE;
+    activeIndex = -1;
+    return;
+  }
+  robotState       = WAITING_RESPONSE;
+  activeIndex      = idx;
+  autoMotionActive = false;
+  stopMotors();
+  nextReminderAction = millis() + CONFIRM_TIMEOUT_MS;
+  Serial.println("REMINDER: " + reminders[idx].message);
+  showReminderScreen(idx, "REMINDER");
+  if (dfReady) dfPlayer.play(reminders[idx].track);
+  safeBlynkWrite(V0, reminders[idx].message + " | Touch to confirm.");
+}
+
+void handleReminderTimeout() {
+  if (activeIndex < 0 || activeIndex >= numReminders) {
+    robotState  = IDLE;
+    activeIndex = -1;
+    return;
+  }
+  if (reminders[activeIndex].disabled || reminders[activeIndex].skippedToday) {
+    robotState  = IDLE;
+    activeIndex = -1;
+    stopMotors();
+    return;
+  }
+
+  if (reminderRetryStage == 0) {
+    // First no-response: sad face, wait 5 minutes before replay.
+    reminderRetryStage = 1;
+    stopReminderAudio();
+    showEmotion("sad");
+    nextReminderAction = millis() + RETRY_WAIT_MS;
+    safeBlynkWrite(V0, "No touch detected. Reminder will replay in 5 minutes.");
+    return;
+  }
+
+  if (reminderRetryStage == 1) {
+    // Replay the reminder after sad waiting period.
+    reminderRetryStage = 2;
+    showReminderScreen(activeIndex, "REMINDER AGAIN");
+    if (dfReady) dfPlayer.play(reminders[activeIndex].track);
+    nextReminderAction = millis() + RETRY_WAIT_MS;
+    safeBlynkWrite(V0, "Reminder replayed. Waiting for touch.");
+    return;
+  }
+
+  // After replay, no touch = angry retry mode every 5 minutes until confirmed.
+  reminderRetryStage = 3;
+  showEmotion("angry");
+  if (dfReady) dfPlayer.play(reminders[activeIndex].track);
+  nextReminderAction = millis() + RETRY_WAIT_MS;
+  safeBlynkWrite(V0, "Still no confirmation. Angry retry mode. Repeating every 5 minutes.");
+}
+
+void checkTouchSensor() {
+  if (robotState != WAITING_RESPONSE) return;
+  if (touchIsPressed()) {
+    doConfirm();
+  }
+}
+
+void doConfirm() {
+  if (activeIndex >= 0 && activeIndex < numReminders) {
+    reminders[activeIndex].triggeredToday = true;
+  }
+  robotState         = CONFIRMING;
+  reminderRetryStage = 0;
+  stopMotors();
+  stopReminderAudio();
+  Serial.println("Reminder confirmed.");
+  showEmotion("happy");
+  if (dfReady) dfPlayer.play(TRACK_CONFIRM);
+  servoConfirmGesture();
+  safeBlynkWrite(V0, "Task confirmed and marked done.");
+  responsiveDelay(1000, false);
+  robotState  = IDLE;
+  activeIndex = -1;
+  showEmotion("neutral");
+}
+
+void doSnooze() {
+  if (activeIndex < 0 || activeIndex >= numReminders) {
+    robotState = IDLE;
+    return;
+  }
+  stopMotors();
+  stopReminderAudio();
+  robotState         = SNOOZED;
+  snoozeUntil        = millis() + ((unsigned long)snoozeMinutes * 60000UL);
+  reminderRetryStage = 0;
+  Serial.println("Snoozed for " + String(snoozeMinutes) + " minute(s).");
+  showMessage("Snoozed", "Again in " + String(snoozeMinutes) + " min.");
+  showEmotion("sleepy");
+  if (dfReady) dfPlayer.play(TRACK_SNOOZE);
+  safeBlynkWrite(V0, "Snoozed for " + String(snoozeMinutes) + " min.");
+  responsiveDelay(1000, false);
+  showEmotion("neutral");
+}
+
+// ============================================================
+// SENSOR + PIR + NAVIGATION LOGIC
+// ============================================================
+void checkSensors() {
+  // Priority 1: ground detection always wins.
+  if (!floorIsSafe()) {
+    fallDetected = true;
+    handleFallDetected();
+    return;
+  }
+  if (fallDetected) {
+    fallDetected = false;
+    Serial.println("Safe floor detected again.");
+    safeBlynkWrite(V0, "Safe ground detected.");
+    showEmotion(robotState == WAITING_RESPONSE ? "alert" : "neutral");
+  }
+  // Priority 2: front obstacle, only after ground is safe.
+  if (!frontIsClear()) {
+    if (!obstacleDetected) {
+      obstacleDetected = true;
+      handleObstacle();
+    }
+  } else {
+    obstacleDetected = false;
+  }
+}
+
+void handleObstacle() {
+  stopMotors();
+  autoMotionActive = false;
+  Serial.println("Obstacle detected. Turning right until path is clear.");
+  showEmotion("surprised");
+  safeBlynkWrite(V0, "Obstacle detected. Turning right.");
+  if (!manualMotorControl && floorIsSafe() &&
+      (robotState == IDLE || robotState == PIR_INTERACTION)) {
+    obstacleAvoidManeuver();
+  } else {
+    responsiveDelay(250, false);
+  }
+  showEmotion(robotState == WAITING_RESPONSE ? "alert" : "neutral");
+}
+
+void handleFallDetected() {
+  stopMotors();
+  autoMotionActive   = false;
+  manualMotorControl = false;
+  Serial.println("NO GROUND detected. Turning right until ground is found.");
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 14, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(16, 3);
+  display.print("NO GROUND");
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(4, 20);
+  display.print("Stop -> Turn Right");
+  display.setCursor(4, 34);
+  display.print("Searching ground...");
+  display.display();
+  safeBlynkWrite(V0, "No ground detected. Turning right until ground is found.");
+  recoverGroundByTurningRight();
+}
+
+void recoverGroundByTurningRight() {
+  if (avoidanceRunning) return;
+  avoidanceRunning = true;
+  stopMotors();
+  responsiveDelay(100, false);
+  while (!floorIsSafe()) {
+    Blynk.run();
+    timer.run();
+    connectBlynkIfNeeded();
+    // Raw turn used here because normal turnRight() refuses when ground is unsafe.
+    turnRightRaw(TURN_MOTOR_SPEED);
+    delay(250);
+    stopMotors();
+    delay(80);
+  }
+  stopMotors();
+  fallDetected     = false;
+  obstacleDetected = false;
+  avoidanceRunning = false;
+  showMessage("Ground Found", "Safe floor detected.");
+  safeBlynkWrite(V0, "Ground found. Robot can continue.");
+  responsiveDelay(500, false);
+}
+
+void obstacleAvoidManeuver() {
+  if (avoidanceRunning) return;
+  avoidanceRunning = true;
+  stopMotors();
+  responsiveDelay(150, false);
+  while (floorIsSafe() && !frontIsClear()) {
+    turnRightRaw(TURN_MOTOR_SPEED);
+    delay(350);
+    stopMotors();
+    delay(100);
+    Blynk.run();
+    timer.run();
+    connectBlynkIfNeeded();
+  }
+  stopMotors();
+  if (!floorIsSafe()) {
+    avoidanceRunning = false;
+    handleFallDetected();
+    return;
+  }
+  obstacleDetected = false;
+  avoidanceRunning = false;
+  safeBlynkWrite(V0, "Path clear. Moving forward.");
+}
+
+void autonomousForwardStep(unsigned long ms) {
+  if (manualMotorControl || fallDetected) return;
+  if (!canMoveForwardSafely()) {
+    checkSensors();
+    return;
+  }
+  autoMotionActive = true;
+  moveForward();
+  responsiveDelay(ms, true);
+  stopMotors();
+  autoMotionActive = false;
+}
+
+void normalNavigationStep() {
+  if (manualMotorControl)  return;
+  if (avoidanceRunning)    return;
+  if (fallDetected)        return;
+  // Normal navigation only when no reminder or PIR interaction is active.
+  if (robotState != IDLE)  return;
+  if (!floorIsSafe()) {
+    checkSensors();
+    return;
+  }
+  if (!frontIsClear()) {
+    handleObstacle();
+    return;
+  }
+  if (!autoMotionActive) {
+    autoMotionActive = true;
+    moveForward();
+  }
+}
+
+void handlePirSensor() {
+  // Reminder has higher priority than PIR greeting.
+  if (robotState == WAITING_RESPONSE ||
+      robotState == CONFIRMING       ||
+      robotState == SNOOZED) return;
+
+  if (robotState == PIR_INTERACTION) {
+    stopMotors();
+    if (touchIsPressed()) {
+      finishPirInteraction();
+      return;
+    }
+    if (timeReached(pirWaitUntil)) {
+      robotState = IDLE;
+      showEmotion("neutral");
+      safeBlynkWrite(V0, "PIR interaction timed out. Returning to navigation.");
+    }
+    return;
+  }
+
+  if (robotState != IDLE) return;
+  if (digitalRead(PIR_PIN) == HIGH) {
+    startPirInteraction();
+  }
+}
+
+void startPirInteraction() {
+  robotState       = PIR_INTERACTION;
+  autoMotionActive = false;
+  stopMotors();
+  showMessage("Person Detected", "Moving slowly...");
+  safeBlynkWrite(V0, "Person detected by PIR.");
+  if (canMoveForwardSafely()) {
+    moveForwardSlow();
+    responsiveDelay(PIR_APPROACH_MS, true);
+  }
+  stopMotors();
+  showMessage("Person Detected", "Touch sensor to greet.");
+  pirWaitUntil = millis() + PIR_WAIT_MS;
+}
+
+void finishPirInteraction() {
+  stopMotors();
+  showEmotion("happy");
+  servoConfirmGesture();
+  safeBlynkWrite(V0, "Person interaction confirmed by touch.");
+  responsiveDelay(700, false);
+  robotState = IDLE;
+  showEmotion("neutral");
+}
+
+// ============================================================
+// DISPLAY
+// ============================================================
+void updateIdleDisplay(DateTime now) {
+  static unsigned long lastUpdate = 0;
+  if (robotState != IDLE)    return;
+  if (manualMotorControl)    return;
+  if (fallDetected)          return;
+  if (millis() - lastUpdate < 1000) return;
+  lastUpdate = millis();
+
+  char timeBuf[9];
+  snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
+           now.hour(), now.minute(), now.second());
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(16, 0);
+  display.print("Reminder Robot");
+  display.setTextSize(2);
+  display.setCursor(16, 22);
+  display.print(timeBuf);
+  display.setTextSize(1);
+  display.setCursor(22, 52);
+  display.print("Normal Navigation");
+  display.display();
+}
+
+void showMessage(String title, String body) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(4, 2);
+  display.print(title);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 16);
+  display.println(body);
+  display.println();
+  display.println("Touch = Confirm");
+  display.println("App = Snooze");
+  display.display();
+}
+
+void showReminderScreen(int idx, String title) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setTextSize(1);
+  display.setCursor(4, 2);
+  display.print(title);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 16);
+  if (idx >= 0 && idx < numReminders) {
+    if      (reminders[idx].track == TRACK_MEDICINE) display.println("[MEDICINE]");
+    else if (reminders[idx].track == TRACK_MEAL)     display.println("[MEAL]");
+    else                                              display.println("[REMINDER]");
+    display.println(reminders[idx].message);
+  } else {
+    display.println("Scheduled reminder");
+  }
+  display.setCursor(0, 54);
+  display.print("Touch to confirm");
+  display.display();
+}
+
+// ============================================================
+// EMOTION / FACE DISPLAY — UPDATED
+// ============================================================
+
+// ===================== NEUTRAL =====================
+void showNeutralFace() {
+  display.clearDisplay();
+  display.fillCircle(42, 22, 7, SSD1306_WHITE);
+  display.fillCircle(86, 22, 7, SSD1306_WHITE);
+  display.drawLine(54, 46, 74, 46, SSD1306_WHITE);
+  display.drawLine(54, 47, 74, 47, SSD1306_WHITE);
+  display.display();
+}
+
+// ===================== HAPPY =====================
+void showHappyFace() {
+  display.clearDisplay();
+  // Happy eyes (V-shape / bright)
+  display.drawLine(34, 20, 50, 30, SSD1306_WHITE);
+  display.drawLine(50, 30, 58, 18, SSD1306_WHITE);
+  display.drawLine(78, 30, 94, 20, SSD1306_WHITE);
+  display.drawLine(70, 18, 78, 30, SSD1306_WHITE);
+  // Smile (upward curve)
+  for (int x = -20; x <= 20; x++) {
+    int y = (x * x) / 30;
+    display.drawPixel(64 + x, 35 + y, SSD1306_WHITE);
+    display.drawPixel(64 + x, 36 + y, SSD1306_WHITE);
+  }
+  display.display();
+}
+
+// ===================== SAD =====================
+void showSadFace() {
+  display.clearDisplay();
+  display.fillCircle(42, 22, 7, SSD1306_WHITE);
+  display.fillCircle(86, 22, 7, SSD1306_WHITE);
+  // Downward curve mouth
+  for (int x = -18; x <= 18; x++) {
+    int y = (x * x) / 35;
+    display.drawPixel(64 + x, 55 - y, SSD1306_WHITE);
+    display.drawPixel(64 + x, 54 - y, SSD1306_WHITE);
+  }
+  display.display();
+}
+
+// ===================== ANGRY =====================
+void showAngryFace() {
+  display.clearDisplay();
+  // Angry eyebrows
+  display.drawLine(30, 14, 48, 24, SSD1306_WHITE);
+  display.drawLine(98, 14, 80, 24, SSD1306_WHITE);
+  display.fillCircle(42, 28, 5, SSD1306_WHITE);
+  display.fillCircle(86, 28, 5, SSD1306_WHITE);
+  // Flat angry mouth
+  display.drawLine(50, 48, 78, 48, SSD1306_WHITE);
+  display.drawLine(50, 49, 78, 49, SSD1306_WHITE);
+  display.display();
+}
+
+// ===================== SLEEPY =====================
+void showSleepyFace() {
+  display.clearDisplay();
+  // Half-closed eyes (lines)
+  display.drawLine(32, 24, 52, 24, SSD1306_WHITE);
+  display.drawLine(76, 24, 96, 24, SSD1306_WHITE);
+  // Neutral mouth
+  display.drawLine(54, 46, 74, 46, SSD1306_WHITE);
+  // Z
+  display.setTextSize(1);
+  display.setCursor(100, 8);
+  display.print("Z");
+  display.display();
+}
+
+// ===================== SURPRISED =====================
+void showSurprisedFace() {
+  display.clearDisplay();
+  // Wide open eyes
+  display.drawCircle(42, 20, 8, SSD1306_WHITE);
+  display.drawCircle(86, 20, 8, SSD1306_WHITE);
+  display.fillCircle(42, 20, 3, SSD1306_WHITE);
+  display.fillCircle(86, 20, 3, SSD1306_WHITE);
+  // Open mouth (circle)
+  display.drawCircle(64, 46, 8, SSD1306_WHITE);
+  display.display();
+}
+
+// ===================== ALERT =====================
+void showAlertFace() {
+  display.clearDisplay();
+  // Wide eyes
+  display.drawCircle(42, 20, 8, SSD1306_WHITE);
+  display.drawCircle(86, 20, 8, SSD1306_WHITE);
+  display.fillCircle(42, 20, 2, SSD1306_WHITE);
+  display.fillCircle(86, 20, 2, SSD1306_WHITE);
+  // Exclamation mark
+  display.drawLine(64, 36, 64, 50, SSD1306_WHITE);
+  display.fillCircle(64, 56, 2, SSD1306_WHITE);
+  display.display();
+}
+
+// ===================== MAIN EMOTION DISPATCHER =====================
+void showEmotion(String mood) {
+  if      (mood == "happy")     showHappyFace();
+  else if (mood == "sad")       showSadFace();
+  else if (mood == "angry")     showAngryFace();
+  else if (mood == "sleepy")    showSleepyFace();
+  else if (mood == "surprised") showSurprisedFace();
+  else if (mood == "alert")     showAlertFace();
+  else                          showNeutralFace(); // default: neutral
+}
+
+void showMotorStatus(String status) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK);
+  display.setCursor(4, 2);
+  display.print("Motor Control");
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 28);
+  display.print(status);
+  display.setCursor(6, 46);
+  display.print("App control");
+  display.display();
+}
+
+// ============================================================
+// SERVO / ACTIONS
+// ============================================================
+void stopReminderAudio() {
+  if (dfReady) dfPlayer.stop();
+}
+
+void servoConfirmGesture() {
+  armServo.write(0);
+  responsiveDelay(200, false);
+  armServo.write(90);
+  responsiveDelay(350, false);
+  armServo.write(0);
+  responsiveDelay(250, false);
+}
+
+void waveArm() {
+  for (int i = 0; i < 2; i++) {
+    armServo.write(0);
+    responsiveDelay(180, false);
+    armServo.write(90);
+    responsiveDelay(180, false);
+  }
+  armServo.write(0);
+}
+
+void cheerfulAction() {
+  if (dfReady) dfPlayer.play(TRACK_CHEER);
+  servoConfirmGesture();
+}
+
+// ============================================================
+// MOTOR SAFETY + CONTROL
+// ============================================================
+bool floorIsSafe() {
+  return digitalRead(IR_FALL_PIN) == FLOOR_SAFE;
+}
+
+bool frontIsClear() {
+  return digitalRead(IR_OBSTACLE_PIN) != OBSTACLE_DETECTED;
+}
+
+bool canMoveForwardSafely() {
+  return floorIsSafe() && frontIsClear();
+}
+
+bool canMoveBasicSafely() {
+  return floorIsSafe();
+}
+
+bool touchIsPressed() {
+  return touchRead(TOUCH_PIN) < TOUCH_THRESH;
+}
+
+void moveForward() {
+  moveForwardSpeed(MOTOR_SPEED);
+}
+
+void moveForwardSlow() {
+  moveForwardSpeed(SLOW_MOTOR_SPEED);
+}
+
+void moveForwardSpeed(int speed) {
+  if (!canMoveForwardSafely()) {
+    stopMotors();
+    Serial.println("Forward blocked by sensor.");
+    safeBlynkWrite(V0, "Forward blocked: obstacle or no ground.");
+    return;
+  }
+  speed = constrain(speed, 0, 255);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void moveBackward() {
+  if (!canMoveBasicSafely()) {
+    stopMotors();
+    Serial.println("Backward blocked by edge sensor.");
+    safeBlynkWrite(V0, "Backward blocked: no ground.");
+    return;
+  }
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, MOTOR_SPEED);
+  analogWrite(ENB, MOTOR_SPEED);
+}
+
+void turnLeft() {
+  if (!canMoveBasicSafely()) {
+    stopMotors();
+    Serial.println("Left turn blocked by edge sensor.");
+    safeBlynkWrite(V0, "Left turn blocked: no ground.");
+    return;
+  }
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, MOTOR_SPEED);
+  analogWrite(ENB, MOTOR_SPEED);
+}
+
+void turnRight() {
+  if (!canMoveBasicSafely()) {
+    stopMotors();
+    Serial.println("Right turn blocked by edge sensor. Use recovery logic.");
+    safeBlynkWrite(V0, "Right turn blocked: no ground.");
+    return;
+  }
+  turnRightRaw(MOTOR_SPEED);
+}
+
+void turnRightRaw(int speed) {
+  speed = constrain(speed, 0, 255);
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void stopMotors() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
